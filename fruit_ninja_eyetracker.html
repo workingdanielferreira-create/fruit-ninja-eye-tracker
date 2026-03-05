@@ -1,0 +1,1228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' https://webgazer.cs.brown.edu https://cdn.jsdelivr.net blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; media-src 'self' blob:; img-src 'self' data: blob:; connect-src * blob:; worker-src 'self' blob:;">
+    <title>Eye-Tracking Fruit Ninja</title>
+    <!-- INTERCEPTOR: Redirect MediaPipe model file requests to jsDelivr CDN -->
+    <script>
+    (function() {
+        const MP_CDN = 'https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619';
+        const _fetch = window.fetch;
+        window.fetch = function(input, init) {
+            let url = (typeof input === 'string') ? input : (input && input.url) ? input.url : '';
+            if (url && url.includes('/mediapipe/face_mesh/')) {
+                const filename = url.split('/').pop();
+                const newUrl = MP_CDN + '/' + filename;
+                console.log('[MP-CDN] fetch redirect:', filename);
+                return _fetch.call(this, newUrl, init);
+            }
+            return _fetch.call(this, input, init);
+        };
+        const _xhrOpen = XMLHttpRequest.prototype.open;
+        XMLHttpRequest.prototype.open = function(method, url) {
+            if (typeof url === 'string' && url.includes('/mediapipe/face_mesh/')) {
+                var filename = url.split('/').pop();
+                url = MP_CDN + '/' + filename;
+                console.log('[MP-CDN] XHR redirect:', filename);
+            }
+            return _xhrOpen.apply(this, [method, url].concat(Array.prototype.slice.call(arguments, 2)));
+        };
+        var _createElement = document.createElement.bind(document);
+        document.createElement = function(tag, options) {
+            var el = _createElement(tag, options);
+            if (tag.toLowerCase() === 'script') {
+                var realSrcDescriptor = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype, 'src');
+                if (realSrcDescriptor && realSrcDescriptor.set) {
+                    Object.defineProperty(el, 'src', {
+                        set: function(val) {
+                            if (typeof val === 'string' && val.includes('/mediapipe/face_mesh/')) {
+                                var filename = val.split('/').pop();
+                                val = MP_CDN + '/' + filename;
+                                console.log('[MP-CDN] script.src redirect:', filename);
+                            }
+                            realSrcDescriptor.set.call(this, val);
+                        },
+                        get: function() { return realSrcDescriptor.get.call(this); },
+                        configurable: true
+                    });
+                }
+                var _setAttribute = el.setAttribute.bind(el);
+                el.setAttribute = function(name, value) {
+                    if (name === 'src' && typeof value === 'string' && value.includes('/mediapipe/face_mesh/')) {
+                        var filename = value.split('/').pop();
+                        value = MP_CDN + '/' + filename;
+                        console.log('[MP-CDN] setAttribute redirect:', filename);
+                    }
+                    return _setAttribute(name, value);
+                };
+            }
+            return el;
+        };
+        console.log('[MP-CDN] MediaPipe CDN interceptor installed.');
+    })();
+    </script>
+    <script src="https://webgazer.cs.brown.edu/webgazer.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Bangers&family=Outfit:wght@400;600;700&display=swap');
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Outfit', sans-serif;
+            overflow: hidden;
+            background: #0a0a12;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            width: 100vw;
+        }
+
+        #gameCanvas {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+            background: linear-gradient(180deg, #0d0d1a 0%, #111428 50%, #0a1628 100%);
+        }
+
+        #ui {
+            position: absolute;
+            top: 20px;
+            left: 24px;
+            color: white;
+            z-index: 10;
+            pointer-events: none;
+        }
+
+        #score {
+            font-family: 'Bangers', cursive;
+            font-size: 56px;
+            color: #ffd700;
+            text-shadow: 0 0 20px rgba(255, 215, 0, 0.5), 2px 2px 0 rgba(0,0,0,0.5);
+            letter-spacing: 2px;
+        }
+
+        .stat-line {
+            font-size: 15px;
+            margin-top: 6px;
+            color: rgba(255,255,255,0.7);
+            font-weight: 600;
+        }
+        .stat-line span { color: #fff; }
+
+        #inputModeIndicator {
+            position: absolute;
+            top: 20px;
+            right: 24px;
+            color: rgba(255,255,255,0.6);
+            font-size: 13px;
+            font-weight: 600;
+            z-index: 10;
+            pointer-events: none;
+            text-align: right;
+        }
+        #inputModeIndicator .mode-label {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 20px;
+            background: rgba(255,255,255,0.08);
+            border: 1px solid rgba(255,255,255,0.12);
+        }
+        #gazeQuality {
+            display: block;
+            margin-top: 6px;
+            font-size: 11px;
+            opacity: 0.5;
+        }
+
+        /* ---------- OVERLAYS ---------- */
+        .overlay {
+            position: fixed;
+            inset: 0;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+            color: white;
+            text-align: center;
+            background: rgba(6, 6, 14, 0.96);
+        }
+        .overlay.hidden { display: none; }
+
+        .overlay h1 {
+            font-family: 'Bangers', cursive;
+            font-size: 52px;
+            letter-spacing: 3px;
+            color: #ffd700;
+            text-shadow: 0 0 30px rgba(255,215,0,0.4);
+            margin-bottom: 24px;
+        }
+
+        .overlay p {
+            font-size: 19px;
+            margin-bottom: 12px;
+            max-width: 640px;
+            line-height: 1.5;
+            color: rgba(255,255,255,0.8);
+        }
+        .overlay .sub {
+            font-size: 14px;
+            color: rgba(255,255,255,0.4);
+            margin-top: 18px;
+        }
+
+        .btn {
+            display: inline-block;
+            margin-top: 28px;
+            padding: 16px 52px;
+            font-family: 'Bangers', cursive;
+            font-size: 28px;
+            letter-spacing: 2px;
+            color: #fff;
+            border: none;
+            border-radius: 60px;
+            cursor: pointer;
+            transition: transform 0.15s, box-shadow 0.15s;
+        }
+        .btn:hover { transform: scale(1.06); }
+        .btn:active { transform: scale(0.97); }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #6c5ce7 0%, #a855f7 100%);
+            box-shadow: 0 6px 24px rgba(108, 92, 231, 0.4);
+        }
+        .btn-secondary {
+            background: linear-gradient(135deg, #2d3436 0%, #636e72 100%);
+            box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+            font-size: 20px;
+            padding: 12px 36px;
+            margin-top: 12px;
+        }
+
+        #gameOver h1 {
+            color: #ff4444;
+            text-shadow: 0 0 30px rgba(255,68,68,0.5);
+        }
+        #finalScore {
+            font-family: 'Bangers', cursive;
+            font-size: 64px;
+            color: #ffd700;
+            text-shadow: 0 0 20px rgba(255,215,0,0.4);
+        }
+
+        /* ---------- CALIBRATION ---------- */
+        #calibrationPhase { background: rgba(6, 6, 14, 0.98); }
+        #calibrationPhase .info {
+            position: absolute;
+            top: 40px;
+            left: 50%;
+            transform: translateX(-50%);
+            text-align: center;
+        }
+        #calibrationPhase .info h2 {
+            font-family: 'Bangers', cursive;
+            font-size: 32px;
+            color: #ffd700;
+            letter-spacing: 2px;
+        }
+        #calibrationPhase .info p {
+            font-size: 17px;
+            color: rgba(255,255,255,0.6);
+            margin-top: 8px;
+        }
+
+        #calibrationDot {
+            position: absolute;
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            background: radial-gradient(circle, #ffd700 30%, #ff8c00 100%);
+            box-shadow: 0 0 24px rgba(255, 215, 0, 0.7), 0 0 60px rgba(255, 215, 0, 0.2);
+            cursor: pointer;
+            display: none;
+            z-index: 1001;
+            transition: left 0.3s ease, top 0.3s ease;
+        }
+        #calibrationDot::after {
+            content: '';
+            position: absolute;
+            inset: -6px;
+            border-radius: 50%;
+            border: 2px solid rgba(255, 215, 0, 0.3);
+            animation: calPulse 1s infinite;
+        }
+        @keyframes calPulse {
+            0%, 100% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.4); opacity: 0.3; }
+        }
+
+        #validationDot {
+            position: absolute;
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            background: radial-gradient(circle, #00ff88 30%, #00cc66 100%);
+            box-shadow: 0 0 20px rgba(0, 255, 136, 0.6);
+            display: none;
+            z-index: 1001;
+            transition: left 0.3s ease, top 0.3s ease;
+        }
+
+        /* Hide WebGazer injected elements */
+        #webgazerVideoContainer, #webgazerVideoFeed, #webgazerFaceFeedbackBox,
+        #webgazerFaceOverlay, #webgazerGazeDot, #webgazerVideoCanvas {
+            display: none !important;
+        }
+    </style>
+</head>
+<body>
+
+<!-- START SCREEN -->
+<div id="startOverlay" class="overlay">
+    <h1>🍉 EYE-TRACKING FRUIT NINJA 🍉</h1>
+    <p>Look at the fruits to slice them with your eyes!</p>
+    <p>⚠️ Avoid bombs — stare too long and it's GAME OVER!</p>
+    <p>⭐ Golden stars = bonus points</p>
+    <button id="startButton" class="btn btn-primary">START GAME</button>
+    <button id="mouseButton" class="btn btn-secondary">Play with Mouse Instead</button>
+    <p class="sub">Camera access required for eye tracking · Chrome/Edge recommended · Good lighting helps accuracy</p>
+</div>
+
+<!-- CALIBRATION -->
+<div id="calibrationPhase" class="overlay hidden">
+    <div class="info">
+        <h2 id="calibTitle">CALIBRATION</h2>
+        <p id="calibInstruction">Look at each dot and click it · <span id="calibClicksLeft"></span></p>
+        <p id="calibrationProgress" style="font-size: 14px; color: rgba(255,255,255,0.4);">
+            Point <span id="currentPoint">1</span> of <span id="totalPoints">13</span>
+        </p>
+    </div>
+    <div id="calibrationDot"></div>
+    <div id="validationDot"></div>
+</div>
+
+<!-- GAME OVER -->
+<div id="gameOver" class="overlay hidden">
+    <h1>💥 GAME OVER 💥</h1>
+    <p style="margin-bottom: 4px;">Final Score</p>
+    <div id="finalScore">0</div>
+    <button id="restartButton" class="btn btn-primary">PLAY AGAIN</button>
+    <button id="recalibrateButton" class="btn btn-secondary">Recalibrate & Play</button>
+</div>
+
+<!-- HUD -->
+<div id="ui">
+    <div id="score">0</div>
+    <div class="stat-line">Sliced: <span id="fruitsSliced">0</span></div>
+    <div class="stat-line">Wave: <span id="difficulty">1</span></div>
+</div>
+<div id="inputModeIndicator">
+    <span class="mode-label" id="modeLabel">👁️ Eye Tracking</span>
+    <span id="gazeQuality"></span>
+</div>
+
+<canvas id="gameCanvas"></canvas>
+
+<script>
+// ============================================================
+//  ONE EURO FILTER — Adaptive low-pass for gaze smoothing
+//  Stable when fixating (low cutoff), responsive during
+//  saccades (high cutoff via speed-based beta term)
+// ============================================================
+class OneEuroFilter {
+    constructor(freq, minCutoff = 1.0, beta = 0.007, dCutoff = 1.0) {
+        this.freq = freq;
+        this.minCutoff = minCutoff;
+        this.beta = beta;
+        this.dCutoff = dCutoff;
+        this.xPrev = null;
+        this.dxPrev = 0.0;
+        this.tPrev = null;
+    }
+
+    _smoothingFactor(te, cutoff) {
+        const r = 2 * Math.PI * cutoff * te;
+        return r / (r + 1);
+    }
+
+    _expSmoothing(a, x, xPrev) {
+        return a * x + (1 - a) * xPrev;
+    }
+
+    reset() {
+        this.xPrev = null;
+        this.dxPrev = 0.0;
+        this.tPrev = null;
+    }
+
+    filter(t, x) {
+        if (this.tPrev === null) {
+            this.xPrev = x;
+            this.tPrev = t;
+            return x;
+        }
+
+        let te = t - this.tPrev;
+        if (te <= 0) te = 1.0 / this.freq;
+
+        // Filter the derivative of the signal
+        const ad = this._smoothingFactor(te, this.dCutoff);
+        const dx = (x - this.xPrev) / te;
+        const dxHat = this._expSmoothing(ad, dx, this.dxPrev);
+
+        // Adaptive cutoff: fast movement → higher cutoff → more responsive
+        const cutoff = this.minCutoff + this.beta * Math.abs(dxHat);
+        const a = this._smoothingFactor(te, cutoff);
+        const xHat = this._expSmoothing(a, x, this.xPrev);
+
+        this.xPrev = xHat;
+        this.dxPrev = dxHat;
+        this.tPrev = t;
+
+        return xHat;
+    }
+}
+
+// ============================================================
+//  CONFIGURATION
+// ============================================================
+const CONFIG = {
+    // One Euro Filter params (tuned for ~15-30 Hz webcam eye tracking)
+    OEF_FREQ: 30,
+    OEF_MIN_CUTOFF: 1.5,      // Hz — jitter reduction when fixating
+    OEF_BETA: 0.5,            // Speed coeff — saccade responsiveness
+    OEF_DCUTOFF: 1.0,         // Derivative cutoff
+
+    // Outlier rejection
+    MAX_JUMP_PX: 400,         // Reject/dampen single-frame jumps above this
+    MIN_SAMPLE_INTERVAL: 10,  // ms — deduplicate rapid-fire samples
+
+    // Hit detection
+    FRUIT_HIT_RADIUS: 90,     // px — generous for ~130px WebGazer error
+    BOMB_HIT_RADIUS: 60,      // px
+    DWELL_SLICE_MS: 100,      // ms gaze on fruit to slice
+    BOMB_DWELL_MS: 450,       // ms gaze on bomb before game over
+
+    // Calibration
+    CLICKS_PER_POINT: 5,      // More clicks per point = better regression
+    VALIDATION_DWELL_MS: 1500,// ms per validation point
+
+    // Gameplay
+    INITIAL_SPAWN_INTERVAL: 1800,
+    MIN_SPAWN_INTERVAL: 500,
+    FRUIT_LAUNCH_SPEED_MIN: 5.5,
+    FRUIT_LAUNCH_SPEED_MAX: 8.5,
+    GRAVITY: 0.11,
+    DIFFICULTY_STEP: 8,
+
+    // Active polling interval
+    POLL_INTERVAL_MS: 16,     // ~60Hz supplement to gaze listener
+};
+
+// ============================================================
+//  CANVAS SETUP
+// ============================================================
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+function resizeCanvas() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+}
+resizeCanvas();
+window.addEventListener('resize', resizeCanvas);
+
+// ============================================================
+//  GAME STATE
+// ============================================================
+let gameState = {
+    score: 0,
+    fruitsSliced: 0,
+    gameRunning: false,
+    difficulty: 1,
+    lastSpawnTime: 0,
+    spawnInterval: CONFIG.INITIAL_SPAWN_INTERVAL,
+};
+
+let useMouseMode = false;
+let fruits = [];
+let particles = [];
+let slashTrail = [];
+let scorePopups = [];
+
+// ============================================================
+//  GAZE STATE — One Euro Filtered
+// ============================================================
+let gazeX = 0;
+let gazeY = 0;
+let lastGazeTimestamp = 0;
+let gazeInitialized = false;
+let gazeSampleCount = 0;
+
+let filterX = new OneEuroFilter(CONFIG.OEF_FREQ, CONFIG.OEF_MIN_CUTOFF, CONFIG.OEF_BETA, CONFIG.OEF_DCUTOFF);
+let filterY = new OneEuroFilter(CONFIG.OEF_FREQ, CONFIG.OEF_MIN_CUTOFF, CONFIG.OEF_BETA, CONFIG.OEF_DCUTOFF);
+
+function processGaze(x, y) {
+    const now = performance.now();
+
+    // Reject invalid
+    if (x == null || y == null || isNaN(x) || isNaN(y)) return;
+
+    // Throttle duplicates
+    if (now - lastGazeTimestamp < CONFIG.MIN_SAMPLE_INTERVAL) return;
+
+    // Clamp to viewport
+    x = Math.max(0, Math.min(window.innerWidth, x));
+    y = Math.max(0, Math.min(window.innerHeight, y));
+
+    // First sample: jump directly
+    if (!gazeInitialized) {
+        gazeX = x;
+        gazeY = y;
+        filterX.reset();
+        filterY.reset();
+        filterX.filter(now / 1000, x);
+        filterY.filter(now / 1000, y);
+        gazeInitialized = true;
+        lastGazeTimestamp = now;
+        gazeSampleCount++;
+        return;
+    }
+
+    // Outlier rejection: dampen huge jumps
+    const dx = x - gazeX;
+    const dy = y - gazeY;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+
+    if (dist > CONFIG.MAX_JUMP_PX) {
+        // Likely a tracking glitch — blend partially instead of jumping
+        x = gazeX + dx * 0.3;
+        y = gazeY + dy * 0.3;
+    }
+
+    // Apply One Euro Filter (time in seconds)
+    const t = now / 1000;
+    gazeX = filterX.filter(t, x);
+    gazeY = filterY.filter(t, y);
+
+    // Final clamp to canvas
+    gazeX = Math.max(0, Math.min(canvas.width, gazeX));
+    gazeY = Math.max(0, Math.min(canvas.height, gazeY));
+
+    lastGazeTimestamp = now;
+    gazeSampleCount++;
+}
+
+// ============================================================
+//  FRUIT TYPES
+// ============================================================
+const fruitTypes = [
+    { name: '🍎', color: '#ff3333', points: 10 },
+    { name: '🍊', color: '#ff8c00', points: 10 },
+    { name: '🍋', color: '#ffd700', points: 10 },
+    { name: '🍌', color: '#ffff00', points: 15 },
+    { name: '🍉', color: '#ff1493', points: 20 },
+    { name: '🍇', color: '#9370db', points: 15 },
+    { name: '🥝', color: '#32cd32', points: 15 },
+    { name: '🍓', color: '#ff4060', points: 10 },
+];
+const specialFruit = { name: '⭐', color: '#ffd700', points: 50 };
+const bomb = { name: '💣', color: '#444', points: 0 };
+
+// ============================================================
+//  FRUIT CLASS
+// ============================================================
+class Fruit {
+    constructor(x, y, type, isSpecial = false, isBomb = false) {
+        this.x = x;
+        this.y = y;
+        this.type = type;
+        this.isSpecial = isSpecial;
+        this.isBomb = isBomb;
+        this.velocityX = (Math.random() - 0.5) * 4;
+        this.velocityY = -(CONFIG.FRUIT_LAUNCH_SPEED_MIN + Math.random() * (CONFIG.FRUIT_LAUNCH_SPEED_MAX - CONFIG.FRUIT_LAUNCH_SPEED_MIN));
+        this.gravity = CONFIG.GRAVITY;
+        this.rotation = Math.random() * Math.PI * 2;
+        this.rotationSpeed = (Math.random() - 0.5) * 0.08;
+        this.size = 44 + Math.random() * 16;
+        this.sliced = false;
+        this.gazeEnterTime = 0;
+        this.gazeInside = false;
+    }
+
+    update() {
+        this.velocityY += this.gravity;
+        this.x += this.velocityX;
+        this.y += this.velocityY;
+        this.rotation += this.rotationSpeed;
+    }
+
+    draw() {
+        ctx.save();
+        ctx.translate(this.x, this.y);
+        ctx.rotate(this.rotation);
+
+        if (this.isSpecial) { ctx.shadowBlur = 30; ctx.shadowColor = '#ffd700'; }
+        if (this.isBomb) { ctx.shadowBlur = 15; ctx.shadowColor = '#ff2200'; }
+
+        ctx.font = `${this.size}px Arial`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(this.type.name, 0, 0);
+
+        // Dwell progress ring for bombs (warning)
+        if (this.isBomb && this.gazeInside && this.gazeEnterTime > 0) {
+            const elapsed = performance.now() - this.gazeEnterTime;
+            const progress = Math.min(elapsed / CONFIG.BOMB_DWELL_MS, 1);
+            ctx.rotate(-this.rotation);
+            ctx.beginPath();
+            ctx.arc(0, 0, this.size * 0.7, -Math.PI / 2, -Math.PI / 2 + progress * Math.PI * 2);
+            ctx.strokeStyle = `rgba(255, ${Math.floor(255 * (1 - progress))}, 0, ${0.6 + progress * 0.4})`;
+            ctx.lineWidth = 4;
+            ctx.stroke();
+        }
+
+        // Dwell progress ring for fruits (subtle feedback)
+        if (!this.isBomb && this.gazeInside && this.gazeEnterTime > 0) {
+            const elapsed = performance.now() - this.gazeEnterTime;
+            const progress = Math.min(elapsed / CONFIG.DWELL_SLICE_MS, 1);
+            if (progress > 0.1) {
+                ctx.rotate(-this.rotation);
+                ctx.beginPath();
+                ctx.arc(0, 0, this.size * 0.65, -Math.PI / 2, -Math.PI / 2 + progress * Math.PI * 2);
+                ctx.strokeStyle = `rgba(255, 255, 255, ${0.3 + progress * 0.5})`;
+                ctx.lineWidth = 3;
+                ctx.stroke();
+            }
+        }
+
+        ctx.restore();
+    }
+
+    getHitRadius() {
+        return this.isBomb ? CONFIG.BOMB_HIT_RADIUS : CONFIG.FRUIT_HIT_RADIUS;
+    }
+
+    isPointInside(x, y) {
+        const dx = x - this.x;
+        const dy = y - this.y;
+        return (dx * dx + dy * dy) < (this.getHitRadius() * this.getHitRadius());
+    }
+}
+
+// ============================================================
+//  PARTICLE CLASS
+// ============================================================
+class Particle {
+    constructor(x, y, color) {
+        this.x = x; this.y = y;
+        this.vx = (Math.random() - 0.5) * 14;
+        this.vy = (Math.random() - 0.5) * 14;
+        this.color = color;
+        this.alpha = 1;
+        this.size = Math.random() * 7 + 3;
+        this.decay = 0.018 + Math.random() * 0.01;
+        this.gravity = 0.25;
+    }
+    update() {
+        this.vy += this.gravity;
+        this.x += this.vx;
+        this.y += this.vy;
+        this.alpha -= this.decay;
+        this.size *= 0.98;
+    }
+    draw() {
+        if (this.alpha <= 0) return;
+        ctx.save();
+        ctx.globalAlpha = this.alpha;
+        ctx.shadowBlur = 12;
+        ctx.shadowColor = this.color;
+        ctx.fillStyle = this.color;
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+    }
+    isDead() { return this.alpha <= 0; }
+}
+
+function createSlashEffect(x, y, color, count = 35) {
+    for (let i = 0; i < count; i++) particles.push(new Particle(x, y, color));
+    for (let i = 0; i < 8; i++) {
+        const s = new Particle(x, y, '#ffffff');
+        s.size = Math.random() * 3 + 1;
+        s.vx *= 1.8; s.vy *= 1.8;
+        particles.push(s);
+    }
+}
+
+function showScorePopup(x, y, points, color) {
+    scorePopups.push({ x, y, text: `+${points}`, color, alpha: 1, vy: -2, life: 60 });
+}
+
+// ============================================================
+//  SPAWN LOGIC
+// ============================================================
+function spawnFruit() {
+    const x = 80 + Math.random() * (canvas.width - 160);
+    const y = canvas.height + 50;
+    const rand = Math.random();
+    let fruit;
+    if (rand < 0.05) {
+        fruit = new Fruit(x, y, specialFruit, true, false);
+    } else if (rand < 0.14) {
+        fruit = new Fruit(x, y, bomb, false, true);
+    } else {
+        const type = fruitTypes[Math.floor(Math.random() * fruitTypes.length)];
+        fruit = new Fruit(x, y, type, false, false);
+    }
+    fruits.push(fruit);
+}
+
+// ============================================================
+//  COLLISION — dwell-based
+// ============================================================
+function checkGazeCollision() {
+    const now = performance.now();
+    for (let i = fruits.length - 1; i >= 0; i--) {
+        const f = fruits[i];
+        if (f.sliced) continue;
+
+        const inside = f.isPointInside(gazeX, gazeY);
+
+        if (inside) {
+            if (!f.gazeInside) {
+                f.gazeInside = true;
+                f.gazeEnterTime = now;
+            }
+            const dwellTime = now - f.gazeEnterTime;
+            const requiredDwell = f.isBomb ? CONFIG.BOMB_DWELL_MS : CONFIG.DWELL_SLICE_MS;
+
+            if (dwellTime >= requiredDwell) {
+                f.sliced = true;
+                if (f.isBomb) {
+                    createSlashEffect(f.x, f.y, '#ff2200', 60);
+                    endGame();
+                    return;
+                } else {
+                    const pts = f.type.points;
+                    gameState.score += pts;
+                    gameState.fruitsSliced++;
+                    createSlashEffect(f.x, f.y, f.type.color, f.isSpecial ? 70 : 35);
+                    showScorePopup(f.x, f.y - 30, pts, f.type.color);
+                    fruits.splice(i, 1);
+                }
+            }
+        } else {
+            f.gazeInside = false;
+            f.gazeEnterTime = 0;
+        }
+    }
+}
+
+// ============================================================
+//  UPDATE & DRAW
+// ============================================================
+function update(timestamp) {
+    if (!gameState.gameRunning) return;
+
+    gameState.difficulty = Math.floor(gameState.fruitsSliced / CONFIG.DIFFICULTY_STEP) + 1;
+    gameState.spawnInterval = Math.max(
+        CONFIG.MIN_SPAWN_INTERVAL,
+        CONFIG.INITIAL_SPAWN_INTERVAL - (gameState.difficulty - 1) * 100
+    );
+
+    if (timestamp - gameState.lastSpawnTime > gameState.spawnInterval) {
+        spawnFruit();
+        if (gameState.difficulty >= 3 && Math.random() < 0.3) spawnFruit();
+        gameState.lastSpawnTime = timestamp;
+    }
+
+    for (let i = fruits.length - 1; i >= 0; i--) {
+        fruits[i].update();
+        if (fruits[i].y > canvas.height + 100) fruits.splice(i, 1);
+    }
+    for (let i = particles.length - 1; i >= 0; i--) {
+        particles[i].update();
+        if (particles[i].isDead()) particles.splice(i, 1);
+    }
+
+    for (let i = scorePopups.length - 1; i >= 0; i--) {
+        const p = scorePopups[i];
+        p.y += p.vy;
+        p.alpha -= 0.016;
+        p.life--;
+        if (p.life <= 0) scorePopups.splice(i, 1);
+    }
+
+    slashTrail.push({ x: gazeX, y: gazeY, alpha: 0.7 });
+    if (slashTrail.length > 14) slashTrail.shift();
+    for (const pt of slashTrail) pt.alpha -= 0.045;
+
+    checkGazeCollision();
+
+    document.getElementById('score').textContent = gameState.score;
+    document.getElementById('fruitsSliced').textContent = gameState.fruitsSliced;
+    document.getElementById('difficulty').textContent = gameState.difficulty;
+}
+
+function draw() {
+    ctx.fillStyle = 'rgba(13, 13, 26, 0.35)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Gaze trail
+    for (let i = 1; i < slashTrail.length; i++) {
+        const pt = slashTrail[i];
+        const prev = slashTrail[i - 1];
+        if (pt.alpha <= 0) continue;
+        ctx.save();
+        ctx.globalAlpha = Math.max(0, pt.alpha) * 0.5;
+        ctx.strokeStyle = '#ffd700';
+        ctx.lineWidth = 3;
+        ctx.shadowBlur = 10;
+        ctx.shadowColor = '#ffd700';
+        ctx.beginPath();
+        ctx.moveTo(prev.x, prev.y);
+        ctx.lineTo(pt.x, pt.y);
+        ctx.stroke();
+        ctx.restore();
+    }
+
+    for (const p of particles) p.draw();
+    for (const f of fruits) f.draw();
+
+    for (const p of scorePopups) {
+        if (p.alpha <= 0) continue;
+        ctx.save();
+        ctx.globalAlpha = Math.max(0, p.alpha);
+        ctx.font = 'bold 28px Bangers, cursive';
+        ctx.fillStyle = p.color;
+        ctx.textAlign = 'center';
+        ctx.shadowBlur = 8;
+        ctx.shadowColor = p.color;
+        ctx.fillText(p.text, p.x, p.y);
+        ctx.restore();
+    }
+
+    // Gaze cursor
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(gazeX, gazeY, 26, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255, 215, 0, 0.12)';
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(gazeX, gazeY, 26, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(255, 215, 0, 0.45)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(gazeX, gazeY, 4, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255, 215, 0, 0.85)';
+    ctx.fill();
+    ctx.restore();
+}
+
+let animFrameId = null;
+function gameLoop(timestamp) {
+    update(timestamp);
+    draw();
+    animFrameId = requestAnimationFrame(gameLoop);
+}
+
+// ============================================================
+//  GAME LIFECYCLE
+// ============================================================
+function endGame() {
+    gameState.gameRunning = false;
+    document.getElementById('finalScore').textContent = gameState.score;
+    document.getElementById('gameOver').classList.remove('hidden');
+}
+
+function startGame() {
+    gameState = {
+        score: 0, fruitsSliced: 0, gameRunning: true,
+        difficulty: 1, lastSpawnTime: 0,
+        spawnInterval: CONFIG.INITIAL_SPAWN_INTERVAL,
+    };
+    fruits = [];
+    particles = [];
+    slashTrail = [];
+    scorePopups = [];
+
+    // Reset filters (fresh start for game)
+    filterX = new OneEuroFilter(CONFIG.OEF_FREQ, CONFIG.OEF_MIN_CUTOFF, CONFIG.OEF_BETA, CONFIG.OEF_DCUTOFF);
+    filterY = new OneEuroFilter(CONFIG.OEF_FREQ, CONFIG.OEF_MIN_CUTOFF, CONFIG.OEF_BETA, CONFIG.OEF_DCUTOFF);
+    gazeInitialized = false;
+
+    document.getElementById('startOverlay').classList.add('hidden');
+    document.getElementById('calibrationPhase').classList.add('hidden');
+    document.getElementById('gameOver').classList.add('hidden');
+
+    if (animFrameId) cancelAnimationFrame(animFrameId);
+    gameLoop(0);
+}
+
+// ============================================================
+//  MOUSE FALLBACK
+// ============================================================
+function enableMouseMode() {
+    useMouseMode = true;
+    document.getElementById('modeLabel').textContent = '🖱️ Mouse Mode';
+    canvas.addEventListener('mousemove', (e) => {
+        const rect = canvas.getBoundingClientRect();
+        const scaleX = canvas.width / rect.width;
+        const scaleY = canvas.height / rect.height;
+        processGaze((e.clientX - rect.left) * scaleX, (e.clientY - rect.top) * scaleY);
+    });
+}
+
+// ============================================================
+//  WEBGAZER INITIALIZATION
+// ============================================================
+let webgazerReady = false;
+let pollIntervalId = null;
+
+async function initEyeTracking() {
+    try {
+        console.log('[EyeTrack] Checking browser support...');
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            throw new Error('Browser does not support camera access. Use Chrome or Edge.');
+        }
+
+        console.log('[EyeTrack] Checking WebGazer...');
+        if (typeof webgazer === 'undefined') {
+            throw new Error('WebGazer library failed to load.');
+        }
+
+        console.log('[EyeTrack] Requesting camera...');
+        const stream = await navigator.mediaDevices.getUserMedia({
+            video: { width: 640, height: 480, facingMode: 'user' }
+        });
+        console.log('[EyeTrack] Camera granted.');
+        stream.getTracks().forEach(t => t.stop());
+
+        console.log('[EyeTrack] Configuring WebGazer...');
+        webgazer.params.showVideo = false;
+        webgazer.params.showFaceOverlay = false;
+        webgazer.params.showFaceFeedbackBox = false;
+        webgazer.params.showGazeDot = false;
+        webgazer.params.videoViewerWidth = 640;
+        webgazer.params.videoViewerHeight = 480;
+
+        console.log('[EyeTrack] Calling webgazer.begin()...');
+        await webgazer.begin();
+        console.log('[EyeTrack] webgazer.begin() completed.');
+
+        // Wait for face mesh model stabilization
+        console.log('[EyeTrack] Stabilizing model...');
+        await new Promise(r => setTimeout(r, 3500));
+
+        // Enable Kalman filter inside WebGazer for pre-smoothing
+        try { webgazer.applyKalmanFilter(true); } catch(e) { console.warn('Kalman skip:', e.message); }
+        try { webgazer.saveDataAcrossSessions(false); } catch(e) {}
+
+        // Primary gaze listener
+        console.log('[EyeTrack] Setting gaze listener...');
+        webgazer.setGazeListener((data) => {
+            if (!data) return;
+            processGaze(data.x, data.y);
+        });
+
+        // Supplementary active polling at ~60Hz
+        // Helps fill gaps when the listener is throttled
+        pollIntervalId = setInterval(async () => {
+            try {
+                const pred = await webgazer.getCurrentPrediction();
+                if (pred && pred.x != null && pred.y != null) {
+                    processGaze(pred.x, pred.y);
+                }
+            } catch(e) { /* ignore */ }
+        }, CONFIG.POLL_INTERVAL_MS);
+
+        // Hide WebGazer DOM elements
+        requestAnimationFrame(() => {
+            ['webgazerVideoContainer', 'webgazerVideoFeed', 'webgazerFaceFeedbackBox',
+             'webgazerFaceOverlay', 'webgazerGazeDot', 'webgazerVideoCanvas'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.style.display = 'none';
+            });
+        });
+
+        console.log('[EyeTrack] DONE.');
+        webgazerReady = true;
+        return true;
+
+    } catch (error) {
+        console.error('[EyeTrack] FAILED:', error);
+        let msg = 'Eye tracking could not start.\n\n';
+        if (error.name === 'NotAllowedError') {
+            msg += 'Camera permission denied.\n→ Click camera icon in address bar → Allow → Refresh';
+        } else if (error.name === 'NotFoundError') {
+            msg += 'No camera detected.';
+        } else {
+            msg += error.message + '\n\nFalling back to Mouse Mode.';
+        }
+        alert(msg);
+        return false;
+    }
+}
+
+// ============================================================
+//  CALIBRATION — 13 points, 5 clicks each, randomized
+//  + Validation pass to measure accuracy
+// ============================================================
+const calibrationDot = document.getElementById('calibrationDot');
+const validationDot = document.getElementById('validationDot');
+const calibrationPhase = document.getElementById('calibrationPhase');
+let calibrationPoints = [];
+let currentCalibrationPoint = 0;
+let clicksOnCurrentPoint = 0;
+let isValidating = false;
+let validationErrors = [];
+
+function shuffleArray(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+}
+
+function resetCalibProgressDOM() {
+    document.getElementById('calibrationProgress').innerHTML =
+        'Point <span id="currentPoint">1</span> of <span id="totalPoints">13</span>';
+}
+
+function startCalibration() {
+    calibrationPhase.classList.remove('hidden');
+    isValidating = false;
+
+    document.getElementById('calibTitle').textContent = 'CALIBRATION';
+    document.getElementById('calibInstruction').innerHTML =
+        'Look at each dot and click it · <span id="calibClicksLeft"></span>';
+    resetCalibProgressDOM();
+
+    // 13-point layout: 3×3 grid + 4 midpoints
+    const m = 0.06;
+    const positions = [
+        [m, m],       [0.5, m],       [1-m, m],
+        [0.25, 0.25], [0.75, 0.25],
+        [m, 0.5],     [0.5, 0.5],     [1-m, 0.5],
+        [0.25, 0.75], [0.75, 0.75],
+        [m, 1-m],     [0.5, 1-m],     [1-m, 1-m],
+    ];
+
+    calibrationPoints = shuffleArray(positions.map(([px, py]) => ({
+        x: window.innerWidth * px,
+        y: window.innerHeight * py,
+    })));
+
+    document.getElementById('totalPoints').textContent = calibrationPoints.length;
+    currentCalibrationPoint = 0;
+    clicksOnCurrentPoint = 0;
+    showNextCalibrationPoint();
+}
+
+function showNextCalibrationPoint() {
+    if (currentCalibrationPoint >= calibrationPoints.length) {
+        startValidation();
+        return;
+    }
+    const pt = calibrationPoints[currentCalibrationPoint];
+    calibrationDot.style.left = (pt.x - 18) + 'px';
+    calibrationDot.style.top = (pt.y - 18) + 'px';
+    calibrationDot.style.display = 'block';
+    document.getElementById('currentPoint').textContent = currentCalibrationPoint + 1;
+    updateCalibClicksLabel();
+}
+
+function updateCalibClicksLabel() {
+    const remaining = CONFIG.CLICKS_PER_POINT - clicksOnCurrentPoint;
+    const el = document.getElementById('calibClicksLeft');
+    if (el) el.textContent = `${remaining} click${remaining !== 1 ? 's' : ''} remaining`;
+}
+
+calibrationDot.addEventListener('click', (e) => {
+    webgazer.recordScreenPosition(e.clientX, e.clientY, 'click');
+    clicksOnCurrentPoint++;
+    updateCalibClicksLabel();
+
+    // Brief visual pulse on click
+    calibrationDot.style.transform = 'scale(1.3)';
+    setTimeout(() => { calibrationDot.style.transform = 'scale(1)'; }, 120);
+
+    if (clicksOnCurrentPoint >= CONFIG.CLICKS_PER_POINT) {
+        currentCalibrationPoint++;
+        clicksOnCurrentPoint = 0;
+        showNextCalibrationPoint();
+    }
+});
+
+// ============================================================
+//  VALIDATION — measure accuracy at 5 points (no clicking)
+// ============================================================
+let validationPoints = [];
+let currentValidationPoint = 0;
+let validationSamples = [];
+let validationTimer = null;
+
+function startValidation() {
+    isValidating = true;
+    calibrationDot.style.display = 'none';
+
+    document.getElementById('calibTitle').textContent = 'VALIDATION';
+    document.getElementById('calibInstruction').innerHTML =
+        'Look at each green dot (no clicking needed)';
+    document.getElementById('currentPoint').textContent = '1';
+    document.getElementById('totalPoints').textContent = '5';
+
+    const m = 0.15;
+    validationPoints = [
+        { x: window.innerWidth * m, y: window.innerHeight * m },
+        { x: window.innerWidth * (1 - m), y: window.innerHeight * m },
+        { x: window.innerWidth * 0.5, y: window.innerHeight * 0.5 },
+        { x: window.innerWidth * m, y: window.innerHeight * (1 - m) },
+        { x: window.innerWidth * (1 - m), y: window.innerHeight * (1 - m) },
+    ];
+    validationErrors = [];
+    currentValidationPoint = 0;
+    showNextValidationPoint();
+}
+
+function showNextValidationPoint() {
+    if (currentValidationPoint >= validationPoints.length) {
+        finishValidation();
+        return;
+    }
+
+    const pt = validationPoints[currentValidationPoint];
+    validationDot.style.left = (pt.x - 14) + 'px';
+    validationDot.style.top = (pt.y - 14) + 'px';
+    validationDot.style.display = 'block';
+    document.getElementById('currentPoint').textContent = currentValidationPoint + 1;
+
+    validationSamples = [];
+    const startTime = performance.now();
+
+    validationTimer = setInterval(() => {
+        validationSamples.push({ x: gazeX, y: gazeY });
+
+        if (performance.now() - startTime >= CONFIG.VALIDATION_DWELL_MS) {
+            clearInterval(validationTimer);
+
+            if (validationSamples.length > 0) {
+                let totalDist = 0;
+                for (const s of validationSamples) {
+                    const dx = s.x - pt.x;
+                    const dy = s.y - pt.y;
+                    totalDist += Math.sqrt(dx * dx + dy * dy);
+                }
+                validationErrors.push(totalDist / validationSamples.length);
+            }
+
+            currentValidationPoint++;
+            showNextValidationPoint();
+        }
+    }, 50);
+}
+
+function finishValidation() {
+    validationDot.style.display = 'none';
+    isValidating = false;
+
+    const avgError = validationErrors.length > 0
+        ? validationErrors.reduce((a, b) => a + b, 0) / validationErrors.length
+        : 999;
+
+    console.log('[Validation] Average error:', Math.round(avgError), 'px');
+
+    const info = calibrationPhase.querySelector('.info');
+
+    if (avgError > 250) {
+        // Poor — offer retry
+        info.querySelector('h2').textContent = 'CALIBRATION NEEDS IMPROVEMENT';
+        info.querySelector('p').innerHTML =
+            `Average error: ${Math.round(avgError)}px<br>
+             <span style="font-size:14px;color:rgba(255,255,255,0.5)">
+             Tips: Better lighting · Keep head still · Sit ~50cm from screen
+             </span>`;
+        document.getElementById('calibrationProgress').innerHTML =
+            '<button id="retryCalibBtn" class="btn btn-secondary" style="margin-top:16px;pointer-events:all">Retry Calibration</button>' +
+            '<button id="playAnywayBtn" class="btn btn-secondary" style="margin-top:8px;pointer-events:all;font-size:16px;padding:8px 24px">Play Anyway</button>';
+        document.getElementById('retryCalibBtn').addEventListener('click', () => {
+            resetCalibProgressDOM();
+            try { webgazer.clearData(); } catch(e) {}
+            startCalibration();
+        });
+        document.getElementById('playAnywayBtn').addEventListener('click', () => {
+            resetCalibProgressDOM();
+            startGame();
+        });
+    } else {
+        // Acceptable+
+        const quality = avgError < 100 ? 'Excellent' : avgError < 180 ? 'Good' : 'Acceptable';
+        info.querySelector('h2').textContent = `CALIBRATION ${quality.toUpperCase()}!`;
+        info.querySelector('p').textContent = `Average error: ${Math.round(avgError)}px · Launching game...`;
+        setTimeout(() => {
+            resetCalibProgressDOM();
+            startGame();
+        }, 1500);
+    }
+}
+
+// ============================================================
+//  EVENT LISTENERS
+// ============================================================
+document.getElementById('startButton').addEventListener('click', async () => {
+    const btn = document.getElementById('startButton');
+    btn.textContent = 'INITIALIZING CAMERA...';
+    btn.disabled = true;
+    btn.style.opacity = '0.6';
+
+    const ok = await initEyeTracking();
+    if (ok) {
+        document.getElementById('startOverlay').classList.add('hidden');
+        document.getElementById('modeLabel').textContent = '👁️ Eye Tracking';
+        startCalibration();
+    } else {
+        btn.textContent = 'TRY AGAIN';
+        btn.disabled = false;
+        btn.style.opacity = '1';
+    }
+});
+
+document.getElementById('mouseButton').addEventListener('click', () => {
+    enableMouseMode();
+    startGame();
+});
+
+document.getElementById('restartButton').addEventListener('click', () => {
+    startGame();
+});
+
+document.getElementById('recalibrateButton').addEventListener('click', () => {
+    if (webgazerReady) {
+        document.getElementById('gameOver').classList.add('hidden');
+        try { webgazer.clearData(); } catch(e) {}
+        startCalibration();
+    } else {
+        startGame();
+    }
+});
+
+// Gaze rate indicator (updates every 2s)
+setInterval(() => {
+    if (!webgazerReady || useMouseMode) return;
+    const el = document.getElementById('gazeQuality');
+    if (el) {
+        const rate = Math.min(60, Math.round(gazeSampleCount / 2));
+        gazeSampleCount = 0;
+        el.textContent = `~${rate} Hz`;
+    }
+}, 2000);
+</script>
+</body>
+</html>
