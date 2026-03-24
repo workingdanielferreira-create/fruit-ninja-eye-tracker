@@ -108,6 +108,11 @@
         #validationFeedback .accuracy-label { font-size: 16px; color: rgba(255,255,255,0.6); margin-top: 4px; }
         #validationFeedback .accuracy-action { margin-top: 16px; }
 
+        #monitorIndicator { position: absolute; bottom: 12px; right: 16px; color: rgba(255,255,255,0.3); font-size: 11px; z-index: 10; pointer-events: none; font-family: 'Outfit', monospace; }
+        #monitorIndicator .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #00e676; margin-right: 4px; animation: monPulse 2s infinite; }
+        @keyframes monPulse { 0%,100%{opacity:1;} 50%{opacity:0.3;} }
+        .btn-report { background: linear-gradient(135deg, #00897b 0%, #26a69a 100%); box-shadow: 0 4px 16px rgba(0,137,123,0.3); font-size: 18px; padding: 10px 28px; margin-top: 8px; }
+
         #webgazerVideoContainer, #webgazerVideoFeed, #webgazerFaceFeedbackBox,
         #webgazerFaceOverlay, #webgazerGazeDot, #webgazerVideoCanvas { display: none !important; }
     </style>
@@ -147,6 +152,7 @@
     <div id="finalScore">0</div>
     <button id="restartButton" class="btn btn-primary">PLAY AGAIN</button>
     <button id="recalibrateButton" class="btn btn-secondary">Recalibrate & Play</button>
+    <button id="exportReportButton" class="btn btn-report">📊 Export Eye Tracking Report</button>
 </div>
 
 <div id="ui">
@@ -158,6 +164,7 @@
     <span class="mode-label" id="modeLabel">👁️ Eye Tracking</span>
     <span id="gazeQuality"></span>
 </div>
+<div id="monitorIndicator"><span class="dot"></span>Monitor</div>
 <canvas id="gameCanvas"></canvas>
 
 <script>
@@ -233,6 +240,250 @@ const CONFIG = {
 };
 
 // ============================================================
+//  EYE TRACKING PERFORMANCE MONITOR
+//  Runs in background, collects diagnostics via ring buffers.
+//  Accessible via Ctrl+Shift+M (export) or console: eyeMonitor
+// ============================================================
+class RingBuffer {
+    constructor(capacity) { this.buf = new Float64Array(capacity); this.cap = capacity; this.head = 0; this.len = 0; }
+    push(v) { this.buf[this.head] = v; this.head = (this.head + 1) % this.cap; if (this.len < this.cap) this.len++; }
+    toArray() {
+        if (this.len === 0) return [];
+        if (this.len < this.cap) return Array.from(this.buf.subarray(0, this.len));
+        const start = this.head;
+        return Array.from(this.buf.subarray(start)).concat(Array.from(this.buf.subarray(0, start)));
+    }
+    last() { return this.len === 0 ? 0 : this.buf[(this.head - 1 + this.cap) % this.cap]; }
+    mean() { if (this.len === 0) return 0; let s = 0; for (let i = 0; i < this.len; i++) s += this.buf[i]; return s / this.len; }
+    percentile(p) {
+        const a = this.toArray().sort((a, b) => a - b);
+        if (a.length === 0) return 0;
+        const idx = Math.min(Math.floor(a.length * p), a.length - 1);
+        return a[idx];
+    }
+}
+
+const eyeMonitor = {
+    active: false,
+    sessionStart: 0,
+
+    // Ring buffers — fixed memory, ~60s of data at 60Hz
+    sampleIntervals: new RingBuffer(3600),    // ms between gaze samples
+    gazeJitter: new RingBuffer(1800),         // px frame-to-frame displacement
+    filterInputOutput: new RingBuffer(1800),  // px difference raw vs filtered
+    outlierMagnitudes: new RingBuffer(512),   // px of rejected jumps
+    dwellAccuracy: new RingBuffer(256),       // ms actual dwell vs required
+    hitDistances: new RingBuffer(256),        // px gaze-to-fruit-center at slice
+
+    // Counters — lightweight, no buffer overhead
+    counters: {
+        totalSamples: 0,
+        nullSamples: 0,            // webgazer returned null
+        droppedSamples: 0,         // rejected by interval gate
+        outlierEvents: 0,          // jumps exceeding threshold
+        fruitsSliced: 0,
+        fruitsMissed: 0,           // fell off screen without slicing
+        bombsTriggered: 0,
+        nearMisses: 0,             // gaze entered fruit but dwell too short
+        cornerSamples: 0,          // samples in edge zones
+        saccadeCount: 0,           // fast gaze movements detected
+    },
+
+    // Calibration snapshot
+    calibration: { avgError: null, rating: null, timestamp: null, perPointErrors: [] },
+
+    // Periodic aggregates (computed every 5s)
+    snapshots: [],
+    maxSnapshots: 360,  // 30 min at 5s intervals
+
+    start() {
+        this.active = true;
+        this.sessionStart = performance.now();
+        this.counters = { totalSamples: 0, nullSamples: 0, droppedSamples: 0, outlierEvents: 0,
+            fruitsSliced: 0, fruitsMissed: 0, bombsTriggered: 0, nearMisses: 0, cornerSamples: 0, saccadeCount: 0 };
+        this.sampleIntervals = new RingBuffer(3600);
+        this.gazeJitter = new RingBuffer(1800);
+        this.filterInputOutput = new RingBuffer(1800);
+        this.outlierMagnitudes = new RingBuffer(512);
+        this.dwellAccuracy = new RingBuffer(256);
+        this.hitDistances = new RingBuffer(256);
+        this.snapshots = [];
+    },
+
+    // Called from processGaze — must be fast
+    recordSample(now, rawX, rawY, filtX, filtY, prevX, prevY, wasOutlier, jumpDist, nearEdge) {
+        if (!this.active) return;
+        const c = this.counters;
+        c.totalSamples++;
+
+        // Sample timing
+        const lastInterval = this.sampleIntervals.last();
+        if (c.totalSamples > 1) this.sampleIntervals.push(now - (this._lastSampleTime || now));
+        this._lastSampleTime = now;
+
+        // Jitter: frame-to-frame displacement of filtered gaze
+        const jit = Math.sqrt((filtX - prevX) ** 2 + (filtY - prevY) ** 2);
+        this.gazeJitter.push(jit);
+
+        // Filter effectiveness: how much the filter changed the raw input
+        const fDelta = Math.sqrt((rawX - filtX) ** 2 + (rawY - filtY) ** 2);
+        this.filterInputOutput.push(fDelta);
+
+        // Outlier tracking
+        if (wasOutlier) { c.outlierEvents++; this.outlierMagnitudes.push(jumpDist); }
+        if (nearEdge) c.cornerSamples++;
+
+        // Saccade detection (>200px/frame at 60Hz)
+        if (jit > 200) c.saccadeCount++;
+    },
+
+    recordNull() { if (this.active) this.counters.nullSamples++; },
+    recordDropped() { if (this.active) this.counters.droppedSamples++; },
+
+    recordSlice(fruitX, fruitY, gX, gY, dwellMs, requiredMs, isBomb) {
+        if (!this.active) return;
+        const dist = Math.sqrt((gX - fruitX) ** 2 + (gY - fruitY) ** 2);
+        this.hitDistances.push(dist);
+        this.dwellAccuracy.push(dwellMs - requiredMs); // overshoot in ms
+        if (isBomb) this.counters.bombsTriggered++;
+        else this.counters.fruitsSliced++;
+    },
+
+    recordNearMiss() { if (this.active) this.counters.nearMisses++; },
+    recordMiss() { if (this.active) this.counters.fruitsMissed++; },
+
+    recordCalibration(avgError, rating, perPointErrors) {
+        this.calibration = { avgError, rating, perPointErrors: [...perPointErrors], timestamp: Date.now() };
+    },
+
+    // Periodic snapshot — called every 5s by background interval
+    takeSnapshot() {
+        if (!this.active || this.counters.totalSamples < 10) return;
+        const elapsed = (performance.now() - this.sessionStart) / 1000;
+        const snap = {
+            t: Math.round(elapsed),
+            hz: this.sampleIntervals.len > 0 ? Math.round(1000 / this.sampleIntervals.mean()) : 0,
+            jitterMean: +this.gazeJitter.mean().toFixed(1),
+            jitterP95: +this.gazeJitter.percentile(0.95).toFixed(1),
+            filterDelta: +this.filterInputOutput.mean().toFixed(1),
+            outlierRate: this.counters.totalSamples > 0
+                ? +(this.counters.outlierEvents / this.counters.totalSamples * 100).toFixed(2) : 0,
+            samples: this.counters.totalSamples,
+            nullRate: this.counters.totalSamples > 0
+                ? +((this.counters.nullSamples / (this.counters.totalSamples + this.counters.nullSamples)) * 100).toFixed(1) : 0,
+        };
+        this.snapshots.push(snap);
+        if (this.snapshots.length > this.maxSnapshots) this.snapshots.shift();
+    },
+
+    // Full diagnostic report
+    generateReport() {
+        const c = this.counters;
+        const elapsed = ((performance.now() - this.sessionStart) / 1000).toFixed(1);
+        const totalAttempted = c.totalSamples + c.nullSamples + c.droppedSamples;
+
+        return {
+            meta: { generatedAt: new Date().toISOString(), sessionDurationSec: +elapsed, configSnapshot: { ...CONFIG } },
+            sampling: {
+                totalAttempted,
+                processed: c.totalSamples,
+                nullFromWebgazer: c.nullSamples,
+                droppedByIntervalGate: c.droppedSamples,
+                effectiveHz: this.sampleIntervals.len > 0 ? +(1000 / this.sampleIntervals.mean()).toFixed(1) : 0,
+                intervalMeanMs: +this.sampleIntervals.mean().toFixed(2),
+                intervalP5Ms: +this.sampleIntervals.percentile(0.05).toFixed(2),
+                intervalP95Ms: +this.sampleIntervals.percentile(0.95).toFixed(2),
+            },
+            gazeQuality: {
+                jitterMeanPx: +this.gazeJitter.mean().toFixed(2),
+                jitterMedianPx: +this.gazeJitter.percentile(0.5).toFixed(2),
+                jitterP95Px: +this.gazeJitter.percentile(0.95).toFixed(2),
+                filterCorrectionMeanPx: +this.filterInputOutput.mean().toFixed(2),
+                filterCorrectionP95Px: +this.filterInputOutput.percentile(0.95).toFixed(2),
+                outlierCount: c.outlierEvents,
+                outlierRatePercent: totalAttempted > 0 ? +(c.outlierEvents / totalAttempted * 100).toFixed(2) : 0,
+                outlierMagnitudeMeanPx: +this.outlierMagnitudes.mean().toFixed(1),
+                outlierMagnitudeP95Px: +this.outlierMagnitudes.percentile(0.95).toFixed(1),
+                cornerSamplePercent: c.totalSamples > 0 ? +(c.cornerSamples / c.totalSamples * 100).toFixed(1) : 0,
+                saccadeCount: c.saccadeCount,
+            },
+            hitDetection: {
+                fruitsSliced: c.fruitsSliced,
+                fruitsMissed: c.fruitsMissed,
+                sliceRate: (c.fruitsSliced + c.fruitsMissed) > 0
+                    ? +(c.fruitsSliced / (c.fruitsSliced + c.fruitsMissed) * 100).toFixed(1) : 0,
+                bombsTriggered: c.bombsTriggered,
+                nearMisses: c.nearMisses,
+                hitDistanceMeanPx: +this.hitDistances.mean().toFixed(1),
+                hitDistanceP95Px: +this.hitDistances.percentile(0.95).toFixed(1),
+                dwellOvershootMeanMs: +this.dwellAccuracy.mean().toFixed(1),
+                dwellOvershootP95Ms: +this.dwellAccuracy.percentile(0.95).toFixed(1),
+            },
+            calibration: { ...this.calibration },
+            timeline: this.snapshots,
+            diagnosticFlags: this._computeFlags(),
+        };
+    },
+
+    _computeFlags() {
+        const flags = [];
+        const c = this.counters;
+        const totalAttempted = c.totalSamples + c.nullSamples + c.droppedSamples;
+        const nullRate = totalAttempted > 0 ? c.nullSamples / totalAttempted : 0;
+        const hz = this.sampleIntervals.len > 0 ? 1000 / this.sampleIntervals.mean() : 60;
+        const jP95 = this.gazeJitter.percentile(0.95);
+        const outlierRate = totalAttempted > 0 ? c.outlierEvents / totalAttempted : 0;
+
+        if (nullRate > 0.15) flags.push({ severity: 'high', code: 'HIGH_NULL_RATE', detail: `${(nullRate * 100).toFixed(1)}% null predictions — face detection losing track, check lighting/position` });
+        if (hz < 40) flags.push({ severity: 'high', code: 'LOW_SAMPLE_RATE', detail: `${hz.toFixed(0)}Hz — below 40Hz target, CPU may be overloaded` });
+        if (jP95 > 80) flags.push({ severity: 'medium', code: 'HIGH_JITTER', detail: `P95 jitter ${jP95.toFixed(0)}px — consider increasing ROLLING_AVG_SIZE or lowering OEF_MIN_CUTOFF` });
+        if (outlierRate > 0.08) flags.push({ severity: 'medium', code: 'HIGH_OUTLIER_RATE', detail: `${(outlierRate * 100).toFixed(1)}% outliers — MAX_JUMP_PX may need tuning` });
+        if (c.cornerSamples / Math.max(c.totalSamples, 1) > 0.4) flags.push({ severity: 'low', code: 'EDGE_HEAVY_GAZE', detail: 'Over 40% of gaze in edge zones — recalibration may help' });
+        if (this.calibration.avgError && this.calibration.avgError > CONFIG.ACCURACY_THRESHOLD_OK) flags.push({ severity: 'high', code: 'POOR_CALIBRATION', detail: `Calibration error ${Math.round(this.calibration.avgError)}px — recalibrate in better conditions` });
+        if (c.nearMisses > c.fruitsSliced * 0.5 && c.fruitsSliced > 3) flags.push({ severity: 'medium', code: 'MANY_NEAR_MISSES', detail: `${c.nearMisses} near-misses vs ${c.fruitsSliced} slices — DWELL_SLICE_MS or FRUIT_HIT_RADIUS may need adjustment` });
+        if (this.filterInputOutput.mean() > 60) flags.push({ severity: 'low', code: 'HEAVY_FILTERING', detail: `Filter correcting ${this.filterInputOutput.mean().toFixed(0)}px avg — raw gaze very noisy, OEF params may be over-smoothing` });
+        if (flags.length === 0) flags.push({ severity: 'info', code: 'ALL_NOMINAL', detail: 'No issues detected — eye tracking performing within expected parameters' });
+        return flags;
+    },
+
+    exportJSON() {
+        const report = this.generateReport();
+        const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a'); a.href = url;
+        a.download = `eye-tracking-report-${Date.now()}.json`;
+        a.click(); URL.revokeObjectURL(url);
+        return report;
+    },
+
+    // Quick console summary
+    summary() {
+        const r = this.generateReport();
+        console.group('%c Eye Tracking Monitor Report', 'color:#ffd700;font-weight:bold;font-size:14px');
+        console.log('%cSampling', 'font-weight:bold', r.sampling);
+        console.log('%cGaze Quality', 'font-weight:bold', r.gazeQuality);
+        console.log('%cHit Detection', 'font-weight:bold', r.hitDetection);
+        console.log('%cCalibration', 'font-weight:bold', r.calibration);
+        console.log('%cDiagnostic Flags', 'font-weight:bold', r.diagnosticFlags);
+        console.log('%cTimeline snapshots:', 'font-weight:bold', r.timeline.length);
+        console.groupEnd();
+        return r;
+    }
+};
+
+// Background aggregation — every 5s, lightweight
+setInterval(() => { eyeMonitor.takeSnapshot(); }, 5000);
+
+// Ctrl+Shift+M to export report
+document.addEventListener('keydown', (e) => {
+    if (e.ctrlKey && e.shiftKey && e.key === 'M') {
+        e.preventDefault();
+        const r = eyeMonitor.exportJSON();
+        console.log('Eye tracking report exported.', r.diagnosticFlags);
+    }
+});
+
+// ============================================================
 //  CANVAS
 // ============================================================
 const canvas = document.getElementById('gameCanvas');
@@ -265,8 +516,8 @@ let recentVelocity = 0;
 
 function processGaze(x, y) {
     const now = performance.now();
-    if (x == null || y == null || isNaN(x) || isNaN(y)) return;
-    if (now - lastGazeTimestamp < CONFIG.MIN_SAMPLE_INTERVAL) return;
+    if (x == null || y == null || isNaN(x) || isNaN(y)) { eyeMonitor.recordNull(); return; }
+    if (now - lastGazeTimestamp < CONFIG.MIN_SAMPLE_INTERVAL) { eyeMonitor.recordDropped(); return; }
 
     x = Math.max(0, Math.min(window.innerWidth, x));
     y = Math.max(0, Math.min(window.innerHeight, y));
@@ -295,7 +546,8 @@ function processGaze(x, y) {
     const velocityBoost = Math.min(recentVelocity * 0.3, 150);
     const threshold = (nearEdge ? CONFIG.MAX_JUMP_CORNER_PX : CONFIG.MAX_JUMP_PX) + velocityBoost;
 
-    if (jumpDist > threshold) {
+    const wasOutlier = jumpDist > threshold;
+    if (wasOutlier) {
         x = gazeX + dx * CONFIG.JUMP_DAMPEN;
         y = gazeY + dy * CONFIG.JUMP_DAMPEN;
     }
@@ -326,6 +578,9 @@ function processGaze(x, y) {
         const vel = Math.sqrt((newX - gazeX) ** 2 + (newY - gazeY) ** 2) / dt;
         recentVelocity = recentVelocity * 0.7 + vel * 0.3; // exponential moving average
     }
+
+    // Monitor: record sample metrics (prevX/Y = gazeX/Y before update)
+    eyeMonitor.recordSample(now, rawGazeX, rawGazeY, newX, newY, gazeX, gazeY, wasOutlier, jumpDist, nearEdge);
 
     gazeX = newX;
     gazeY = newY;
@@ -470,6 +725,8 @@ function checkGazeCollision() {
             const req = f.isBomb ? CONFIG.BOMB_DWELL_MS : CONFIG.DWELL_SLICE_MS;
             if (now - f.gazeEnterTime >= req) {
                 f.sliced = true;
+                const dwellMs = now - f.gazeEnterTime;
+                eyeMonitor.recordSlice(f.x, f.y, gazeX, gazeY, dwellMs, req, f.isBomb);
                 if (f.isBomb) {
                     createSlashEffect(f.x, f.y, '#ff2200', 60);
                     endGame(); return;
@@ -482,6 +739,8 @@ function checkGazeCollision() {
                 }
             }
         } else {
+            // Near-miss: gaze was inside but left before dwell completed
+            if (f.gazeInside && f.gazeEnterTime > 0) eyeMonitor.recordNearMiss();
             f.gazeInside = false; f.gazeEnterTime = 0;
         }
     }
@@ -501,7 +760,13 @@ function update(ts) {
         gameState.lastSpawnTime = ts;
     }
 
-    for (let i = fruits.length - 1; i >= 0; i--) { fruits[i].update(); if (fruits[i].y > canvas.height + 100) fruits.splice(i, 1); }
+    for (let i = fruits.length - 1; i >= 0; i--) {
+        fruits[i].update();
+        if (fruits[i].y > canvas.height + 100) {
+            if (!fruits[i].sliced && !fruits[i].isBomb) eyeMonitor.recordMiss();
+            fruits.splice(i, 1);
+        }
+    }
     for (let i = particles.length - 1; i >= 0; i--) { particles[i].update(); if (particles[i].isDead()) particles.splice(i, 1); }
     for (let i = scorePopups.length - 1; i >= 0; i--) {
         const p = scorePopups[i]; p.y += p.vy; p.alpha -= 0.016; p.life--;
@@ -560,11 +825,15 @@ function gameLoop(ts) { update(ts); draw(); animFrameId = requestAnimationFrame(
 
 function endGame() {
     gameState.gameRunning = false;
+    // Auto-log monitor summary to console on game end
+    eyeMonitor.takeSnapshot();
+    eyeMonitor.summary();
     document.getElementById('finalScore').textContent = gameState.score;
     document.getElementById('gameOver').classList.remove('hidden');
 }
 
 function startGame() {
+    eyeMonitor.start();
     gameState = { score: 0, fruitsSliced: 0, gameRunning: true, difficulty: 1, lastSpawnTime: 0, spawnInterval: CONFIG.INITIAL_SPAWN_INTERVAL };
     fruits = []; particles = []; slashTrail = []; scorePopups = [];
     filterX = new OneEuroFilter(CONFIG.OEF_FREQ, CONFIG.OEF_MIN_CUTOFF, CONFIG.OEF_BETA, CONFIG.OEF_DCUTOFF);
@@ -841,6 +1110,7 @@ function showValidationResults() {
     } else {
         rating = 'NEEDS IMPROVEMENT'; color = '#ff5252';
     }
+    eyeMonitor.recordCalibration(avgError, rating, validationErrors);
 
     const info = calibPhase.querySelector('.info');
     info.querySelector('h2').textContent = 'CALIBRATION COMPLETE';
@@ -883,6 +1153,7 @@ document.getElementById('startButton').addEventListener('click', async () => {
 
 document.getElementById('mouseButton').addEventListener('click', () => { enableMouseMode(); startGame(); });
 document.getElementById('restartButton').addEventListener('click', startGame);
+document.getElementById('exportReportButton').addEventListener('click', () => { eyeMonitor.exportJSON(); });
 document.getElementById('recalibrateButton').addEventListener('click', () => {
     if (webgazerReady) {
         document.getElementById('gameOver').classList.add('hidden');
@@ -898,6 +1169,13 @@ setInterval(() => {
     if (!webgazerReady || useMouseMode) return;
     const el = document.getElementById('gazeQuality');
     if (el) { el.textContent = `~${Math.min(60, Math.round(gazeSampleCount / 2))} Hz`; gazeSampleCount = 0; }
+    // Update monitor indicator with live stats
+    const mi = document.getElementById('monitorIndicator');
+    if (mi && eyeMonitor.active && eyeMonitor.counters.totalSamples > 10) {
+        const hz = eyeMonitor.sampleIntervals.len > 0 ? Math.round(1000 / eyeMonitor.sampleIntervals.mean()) : 0;
+        const jit = eyeMonitor.gazeJitter.mean().toFixed(0);
+        mi.innerHTML = `<span class="dot"></span>Monitor · ${hz}Hz · ${jit}px jitter`;
+    }
 }, 2000);
 </script>
 </body>
