@@ -85,9 +85,28 @@
             background: radial-gradient(circle, #ffd700 30%, #ff8c00 100%);
             box-shadow: 0 0 24px rgba(255,215,0,0.7), 0 0 60px rgba(255,215,0,0.2);
             cursor: pointer; display: none; z-index: 1010;
+            transition: transform 0.15s ease-out;
         }
         #calibrationDot::after { content: ''; position: absolute; inset: -6px; border-radius: 50%; border: 2px solid rgba(255,215,0,0.3); animation: calPulse 1s infinite; }
         @keyframes calPulse { 0%,100%{transform:scale(1);opacity:1;} 50%{transform:scale(1.4);opacity:0.3;} }
+        #calibrationDot.shrinking { transform: scale(0); }
+        #calibrationDot canvas.dotProgress {
+            position: absolute; inset: -8px; width: calc(100% + 16px); height: calc(100% + 16px);
+            pointer-events: none; border-radius: 50%;
+        }
+        #validationDot {
+            position: absolute; border-radius: 50%; width: 28px; height: 28px;
+            background: radial-gradient(circle, #00e5ff 30%, #0091ea 100%);
+            box-shadow: 0 0 20px rgba(0,229,255,0.6);
+            display: none; z-index: 1010; pointer-events: none;
+        }
+        #validationFeedback {
+            position: absolute; bottom: 80px; left: 50%; transform: translateX(-50%);
+            text-align: center; z-index: 1020; display: none;
+        }
+        #validationFeedback .accuracy-score { font-family: 'Bangers', cursive; font-size: 48px; letter-spacing: 2px; }
+        #validationFeedback .accuracy-label { font-size: 16px; color: rgba(255,255,255,0.6); margin-top: 4px; }
+        #validationFeedback .accuracy-action { margin-top: 16px; }
 
         #webgazerVideoContainer, #webgazerVideoFeed, #webgazerFaceFeedbackBox,
         #webgazerFaceOverlay, #webgazerGazeDot, #webgazerVideoCanvas { display: none !important; }
@@ -108,9 +127,18 @@
     <div class="info">
         <h2>CALIBRATION</h2>
         <p>Look at the dot, then click it</p>
-        <p id="calibrationProgress" style="font-size:14px;color:rgba(255,255,255,0.4)">Point <span id="currentPoint">1</span> / 13</p>
+        <p id="calibrationProgress" style="font-size:14px;color:rgba(255,255,255,0.4)">Point <span id="currentPoint">1</span> / 13 · Click when focused</p>
     </div>
-    <div id="calibrationDot"></div>
+    <div id="calibrationDot"><canvas class="dotProgress"></canvas></div>
+    <div id="validationDot"></div>
+    <div id="validationFeedback">
+        <div class="accuracy-score" id="accuracyScore"></div>
+        <div class="accuracy-label" id="accuracyLabel"></div>
+        <div class="accuracy-action">
+            <button id="acceptCalibration" class="btn btn-primary" style="padding:12px 36px;font-size:22px;">PLAY</button>
+            <button id="retryCalibration" class="btn btn-secondary" style="margin-left:12px;">Recalibrate</button>
+        </div>
+    </div>
 </div>
 
 <div id="gameOver" class="overlay hidden">
@@ -160,15 +188,21 @@ class OneEuroFilter {
 //  CONFIG
 // ============================================================
 const CONFIG = {
-    // One Euro Filter — tuned for game responsiveness
-    OEF_FREQ: 30,
-    OEF_MIN_CUTOFF: 2.0,     // Higher = less smoothing on slow moves (was 1.5)
-    OEF_BETA: 0.7,           // Higher = faster saccade response (was 0.5)
+    // One Euro Filter — tuned for accuracy + responsiveness balance
+    OEF_FREQ: 60,             // Match actual polling rate
+    OEF_MIN_CUTOFF: 1.2,     // Lower = more smoothing on slow/still gaze (stability)
+    OEF_BETA: 0.4,           // Moderate saccade response (less overshoot)
     OEF_DCUTOFF: 1.0,
 
-    // Gaze processing
-    MAX_JUMP_PX: 500,         // Raised — 400 was clipping legit corner moves
-    MIN_SAMPLE_INTERVAL: 10,
+    // Rolling average buffer — applied after One Euro for extra stability
+    ROLLING_AVG_SIZE: 4,      // Smooth over last 4 samples
+
+    // Gaze processing — adaptive outlier rejection
+    MAX_JUMP_PX: 350,         // Base threshold (adapted by velocity)
+    MAX_JUMP_CORNER_PX: 500,  // Relaxed threshold near screen edges
+    CORNER_MARGIN: 0.15,      // Fraction of screen to consider "corner zone"
+    JUMP_DAMPEN: 0.2,         // Dampen outlier jumps to 20%
+    MIN_SAMPLE_INTERVAL: 16,  // Match 60Hz — avoids processing duplicates
 
     // Hit detection
     FRUIT_HIT_RADIUS: 90,
@@ -176,9 +210,15 @@ const CONFIG = {
     DWELL_SLICE_MS: 100,
     BOMB_DWELL_MS: 450,
 
-    // Calibration — 13 points × 1 click (9 grid + 4 tight corners)
-    CLICKS_PER_POINT: 1,
-    POINT_SETTLE_MS: 400,     // Reduced from 600 — snappier calibration
+    // Calibration — multi-sample auto-collection + validation
+    SAMPLES_PER_POINT: 5,     // Collect 5 gaze samples per calibration point
+    POINT_SETTLE_MS: 600,     // Wait for eye to settle on point
+    SAMPLE_INTERVAL_MS: 120,  // Interval between sample collections
+    CALIB_DOT_SIZE: 48,       // Larger dot for easier fixation
+    VALIDATION_POINTS: 5,     // Number of points to validate after calibration
+    VALIDATION_HOLD_MS: 800,  // Time to hold gaze on validation point
+    ACCURACY_THRESHOLD_GOOD: 80,  // px — average error for "good" rating
+    ACCURACY_THRESHOLD_OK: 140,   // px — average error for "ok" rating
 
     // Gameplay
     INITIAL_SPAWN_INTERVAL: 1800,
@@ -212,9 +252,16 @@ let fruits = [], particles = [], slashTrail = [], scorePopups = [];
 //  GAZE STATE
 // ============================================================
 let gazeX = 0, gazeY = 0;
+let rawGazeX = 0, rawGazeY = 0; // unfiltered for calibration use
 let lastGazeTimestamp = 0, gazeInitialized = false, gazeSampleCount = 0;
 let filterX = new OneEuroFilter(CONFIG.OEF_FREQ, CONFIG.OEF_MIN_CUTOFF, CONFIG.OEF_BETA, CONFIG.OEF_DCUTOFF);
 let filterY = new OneEuroFilter(CONFIG.OEF_FREQ, CONFIG.OEF_MIN_CUTOFF, CONFIG.OEF_BETA, CONFIG.OEF_DCUTOFF);
+
+// Rolling average buffer for post-filter stability
+let rollingBufX = [], rollingBufY = [];
+
+// Velocity tracking for adaptive outlier rejection
+let recentVelocity = 0;
 
 function processGaze(x, y) {
     const now = performance.now();
@@ -224,25 +271,64 @@ function processGaze(x, y) {
     x = Math.max(0, Math.min(window.innerWidth, x));
     y = Math.max(0, Math.min(window.innerHeight, y));
 
+    rawGazeX = x; rawGazeY = y;
+
     if (!gazeInitialized) {
         gazeX = x; gazeY = y;
         filterX.reset(); filterY.reset();
         filterX.filter(now / 1000, x); filterY.filter(now / 1000, y);
+        rollingBufX = [x]; rollingBufY = [y];
+        recentVelocity = 0;
         gazeInitialized = true; lastGazeTimestamp = now; gazeSampleCount++;
         return;
     }
 
-    // Outlier rejection — dampen huge jumps
+    // Adaptive outlier rejection — threshold depends on context
     const dx = x - gazeX, dy = y - gazeY;
-    if (Math.sqrt(dx * dx + dy * dy) > CONFIG.MAX_JUMP_PX) {
-        x = gazeX + dx * 0.3;
-        y = gazeY + dy * 0.3;
+    const jumpDist = Math.sqrt(dx * dx + dy * dy);
+
+    // Near screen edges, use relaxed threshold (WebGazer less accurate there)
+    const cm = CONFIG.CORNER_MARGIN;
+    const nearEdge = (x < window.innerWidth * cm || x > window.innerWidth * (1 - cm) ||
+                      y < window.innerHeight * cm || y > window.innerHeight * (1 - cm));
+    // Adapt threshold: allow larger jumps when gaze has been moving fast
+    const velocityBoost = Math.min(recentVelocity * 0.3, 150);
+    const threshold = (nearEdge ? CONFIG.MAX_JUMP_CORNER_PX : CONFIG.MAX_JUMP_PX) + velocityBoost;
+
+    if (jumpDist > threshold) {
+        x = gazeX + dx * CONFIG.JUMP_DAMPEN;
+        y = gazeY + dy * CONFIG.JUMP_DAMPEN;
     }
 
     // One Euro Filter
     const t = now / 1000;
-    gazeX = Math.max(0, Math.min(canvas.width, filterX.filter(t, x)));
-    gazeY = Math.max(0, Math.min(canvas.height, filterY.filter(t, y)));
+    let fx = filterX.filter(t, x);
+    let fy = filterY.filter(t, y);
+
+    // Rolling average buffer for extra stability
+    rollingBufX.push(fx); rollingBufY.push(fy);
+    if (rollingBufX.length > CONFIG.ROLLING_AVG_SIZE) { rollingBufX.shift(); rollingBufY.shift(); }
+
+    // Weighted rolling average (recent samples weigh more)
+    let sumX = 0, sumY = 0, sumW = 0;
+    for (let i = 0; i < rollingBufX.length; i++) {
+        const w = i + 1; // linear weight: older=1, newest=N
+        sumX += rollingBufX[i] * w;
+        sumY += rollingBufY[i] * w;
+        sumW += w;
+    }
+    const newX = Math.max(0, Math.min(canvas.width, sumX / sumW));
+    const newY = Math.max(0, Math.min(canvas.height, sumY / sumW));
+
+    // Track recent velocity for adaptive thresholding
+    const dt = (now - lastGazeTimestamp) / 1000;
+    if (dt > 0) {
+        const vel = Math.sqrt((newX - gazeX) ** 2 + (newY - gazeY) ** 2) / dt;
+        recentVelocity = recentVelocity * 0.7 + vel * 0.3; // exponential moving average
+    }
+
+    gazeX = newX;
+    gazeY = newY;
 
     lastGazeTimestamp = now; gazeSampleCount++;
 }
@@ -483,6 +569,8 @@ function startGame() {
     fruits = []; particles = []; slashTrail = []; scorePopups = [];
     filterX = new OneEuroFilter(CONFIG.OEF_FREQ, CONFIG.OEF_MIN_CUTOFF, CONFIG.OEF_BETA, CONFIG.OEF_DCUTOFF);
     filterY = new OneEuroFilter(CONFIG.OEF_FREQ, CONFIG.OEF_MIN_CUTOFF, CONFIG.OEF_BETA, CONFIG.OEF_DCUTOFF);
+    rollingBufX = []; rollingBufY = [];
+    recentVelocity = 0;
     gazeInitialized = false;
     document.getElementById('startOverlay').classList.add('hidden');
     document.getElementById('calibrationPhase').classList.add('hidden');
@@ -525,15 +613,12 @@ async function initEyeTracking() {
 
         // weightedRidge: recent clicks weigh more — ideal for explicit calibration
         try { webgazer.setRegression('weightedRidge'); } catch (e) { console.warn('weightedRidge unavailable'); }
-        // Disable Kalman — our One Euro Filter handles smoothing.
-        // Running both causes compounding lag (double-smoothed).
+        // Disable Kalman — our pipeline (One Euro + rolling avg) handles smoothing.
         try { webgazer.applyKalmanFilter(false); } catch (e) {}
         try { webgazer.saveDataAcrossSessions(false); } catch (e) {}
 
-        // Gaze listener
-        webgazer.setGazeListener((d) => { if (d) processGaze(d.x, d.y); });
-
-        // Active polling at ~60Hz
+        // Single gaze source — use polling only (avoids listener+polling race condition)
+        webgazer.setGazeListener(null);
         setInterval(async () => {
             try {
                 const p = await webgazer.getCurrentPrediction();
@@ -557,14 +642,21 @@ async function initEyeTracking() {
 }
 
 // ============================================================
-//  CALIBRATION — 13 points, 1 click each, randomised order
+//  CALIBRATION — multi-sample auto-collection + validation
 //
-//  9-point grid at 8% margin for general coverage, plus
-//  4 tight corner points at 3% so WebGazer learns the extremes.
+//  Phase 1: 13 calibration points, 5 gaze samples each.
+//           User looks at dot, clicks to confirm fixation,
+//           then system auto-collects multiple samples.
+//  Phase 2: 5 validation points measure accuracy.
+//           User sees result and can accept or recalibrate.
 // ============================================================
 const calibDot = document.getElementById('calibrationDot');
 const calibPhase = document.getElementById('calibrationPhase');
+const validationDot = document.getElementById('validationDot');
+const validationFeedback = document.getElementById('validationFeedback');
 let calibPoints = [], curIdx = 0, settleTime = 0;
+let calibSamplesCollected = 0, calibCollecting = false;
+let validationErrors = [];
 
 function shuffle(a) {
     for (let i = a.length - 1; i > 0; i--) {
@@ -574,12 +666,10 @@ function shuffle(a) {
     return a;
 }
 
-function startCalibration() {
-    calibPhase.classList.remove('hidden');
-
+function generateCalibrationPoints() {
     const m = 0.08;  // standard grid margin
-    const t = 0.03;  // tight corner margin
-    calibPoints = shuffle([
+    const t = 0.04;  // tight corner margin (slightly relaxed from 0.03 for better tracking)
+    return shuffle([
         // 3×3 grid
         [m, m], [0.5, m], [1 - m, m],
         [m, 0.5], [0.5, 0.5], [1 - m, 0.5],
@@ -587,50 +677,193 @@ function startCalibration() {
         // 4 tight corners — teaches WebGazer the screen extremes
         [t, t], [1 - t, t], [t, 1 - t], [1 - t, 1 - t],
     ].map(([px, py]) => ({ x: window.innerWidth * px, y: window.innerHeight * py })));
-
-    curIdx = 0;
-    showPoint();
 }
 
-function showPoint() {
+function generateValidationPoints() {
+    // 5 points at different positions than calibration points
+    return shuffle([
+        [0.25, 0.25], [0.75, 0.25], [0.5, 0.5], [0.25, 0.75], [0.75, 0.75]
+    ].map(([px, py]) => ({ x: window.innerWidth * px, y: window.innerHeight * py })));
+}
+
+function drawDotProgress(progress) {
+    const cvs = calibDot.querySelector('canvas.dotProgress');
+    if (!cvs) return;
+    const sz = CONFIG.CALIB_DOT_SIZE + 16;
+    cvs.width = sz; cvs.height = sz;
+    const c = cvs.getContext('2d');
+    c.clearRect(0, 0, sz, sz);
+    if (progress <= 0) return;
+    c.strokeStyle = 'rgba(255,255,255,0.85)';
+    c.lineWidth = 3;
+    c.lineCap = 'round';
+    c.beginPath();
+    c.arc(sz / 2, sz / 2, sz / 2 - 4, -Math.PI / 2, -Math.PI / 2 + progress * Math.PI * 2);
+    c.stroke();
+}
+
+function startCalibration() {
+    calibPhase.classList.remove('hidden');
+    validationFeedback.style.display = 'none';
+    validationDot.style.display = 'none';
+
+    const info = calibPhase.querySelector('.info');
+    info.querySelector('h2').textContent = 'CALIBRATION';
+    info.querySelector('p').textContent = 'Look at the dot, then click it';
+
+    calibPoints = generateCalibrationPoints();
+    curIdx = 0;
+    calibCollecting = false;
+    document.getElementById('currentPoint').parentElement.style.display = '';
+    showCalibPoint();
+}
+
+function showCalibPoint() {
     if (curIdx >= calibPoints.length) {
         calibDot.style.display = 'none';
-        finishCalibration();
+        startValidation();
         return;
     }
     const pt = calibPoints[curIdx];
-    const sz = 40;
+    const sz = CONFIG.CALIB_DOT_SIZE;
     calibDot.style.width = sz + 'px';
     calibDot.style.height = sz + 'px';
     calibDot.style.left = (pt.x - sz / 2) + 'px';
     calibDot.style.top = (pt.y - sz / 2) + 'px';
     calibDot.style.display = 'block';
+    calibDot.classList.remove('shrinking');
     document.getElementById('currentPoint').textContent = curIdx + 1;
     settleTime = performance.now() + CONFIG.POINT_SETTLE_MS;
+    calibSamplesCollected = 0;
+    calibCollecting = false;
+    drawDotProgress(0);
 }
 
+// Click triggers multi-sample auto-collection
 calibDot.addEventListener('click', (e) => {
+    if (calibCollecting) return; // already collecting
     if (performance.now() < settleTime) return;
 
-    webgazer.recordScreenPosition(e.clientX, e.clientY, 'click');
+    calibCollecting = true;
+    calibSamplesCollected = 0;
+    const pt = calibPoints[curIdx];
 
-    // Flash feedback
-    calibDot.style.boxShadow = '0 0 40px rgba(255,255,255,0.9)';
-    setTimeout(() => {
-        calibDot.style.boxShadow = '0 0 24px rgba(255,215,0,0.7), 0 0 60px rgba(255,215,0,0.2)';
-    }, 100);
+    // Record the first sample immediately at the known point position
+    webgazer.recordScreenPosition(pt.x, pt.y, 'click');
+    calibSamplesCollected++;
+    drawDotProgress(calibSamplesCollected / CONFIG.SAMPLES_PER_POINT);
 
-    curIdx++;
-    showPoint();
+    // Auto-collect remaining samples at intervals
+    const collectInterval = setInterval(() => {
+        if (calibSamplesCollected >= CONFIG.SAMPLES_PER_POINT) {
+            clearInterval(collectInterval);
+            // Flash feedback and advance
+            calibDot.style.boxShadow = '0 0 40px rgba(255,255,255,0.9)';
+            setTimeout(() => {
+                calibDot.style.boxShadow = '0 0 24px rgba(255,215,0,0.7), 0 0 60px rgba(255,215,0,0.2)';
+                calibCollecting = false;
+                curIdx++;
+                showCalibPoint();
+            }, 120);
+            return;
+        }
+        // Record at the known point position (not click position — more accurate)
+        webgazer.recordScreenPosition(pt.x, pt.y, 'click');
+        calibSamplesCollected++;
+        drawDotProgress(calibSamplesCollected / CONFIG.SAMPLES_PER_POINT);
+    }, CONFIG.SAMPLE_INTERVAL_MS);
 });
 
-function finishCalibration() {
+// ============================================================
+//  VALIDATION — measure accuracy after calibration
+// ============================================================
+let valPoints = [], valIdx = 0, valSamples = [], valCollecting = false;
+
+function startValidation() {
     const info = calibPhase.querySelector('.info');
-    info.querySelector('h2').textContent = 'READY!';
-    info.querySelector('p').textContent = 'Calibration complete · Launching game...';
-    document.getElementById('calibrationProgress').textContent = '';
-    setTimeout(startGame, 800);
+    info.querySelector('h2').textContent = 'CHECKING ACCURACY';
+    info.querySelector('p').textContent = 'Look at the blue dot — do not click';
+    document.getElementById('currentPoint').parentElement.style.display = 'none';
+
+    valPoints = generateValidationPoints();
+    valIdx = 0;
+    validationErrors = [];
+    showValidationPoint();
 }
+
+function showValidationPoint() {
+    if (valIdx >= valPoints.length) {
+        validationDot.style.display = 'none';
+        showValidationResults();
+        return;
+    }
+    const pt = valPoints[valIdx];
+    validationDot.style.left = (pt.x - 14) + 'px';
+    validationDot.style.top = (pt.y - 14) + 'px';
+    validationDot.style.display = 'block';
+
+    // Wait for settle, then collect gaze samples
+    valSamples = [];
+    valCollecting = false;
+    setTimeout(() => {
+        valCollecting = true;
+        const startTime = performance.now();
+        const collectInterval = setInterval(() => {
+            if (rawGazeX != null && rawGazeY != null) {
+                valSamples.push({ x: gazeX, y: gazeY });
+            }
+            if (performance.now() - startTime >= CONFIG.VALIDATION_HOLD_MS) {
+                clearInterval(collectInterval);
+                valCollecting = false;
+                // Calculate error for this point
+                if (valSamples.length > 0) {
+                    const avgX = valSamples.reduce((s, p) => s + p.x, 0) / valSamples.length;
+                    const avgY = valSamples.reduce((s, p) => s + p.y, 0) / valSamples.length;
+                    const err = Math.sqrt((avgX - pt.x) ** 2 + (avgY - pt.y) ** 2);
+                    validationErrors.push(err);
+                }
+                valIdx++;
+                showValidationPoint();
+            }
+        }, 50);
+    }, 400); // settle time before measuring
+}
+
+function showValidationResults() {
+    const avgError = validationErrors.length > 0
+        ? validationErrors.reduce((a, b) => a + b, 0) / validationErrors.length : 999;
+
+    let rating, color;
+    if (avgError <= CONFIG.ACCURACY_THRESHOLD_GOOD) {
+        rating = 'EXCELLENT'; color = '#00e676';
+    } else if (avgError <= CONFIG.ACCURACY_THRESHOLD_OK) {
+        rating = 'GOOD'; color = '#ffd700';
+    } else {
+        rating = 'NEEDS IMPROVEMENT'; color = '#ff5252';
+    }
+
+    const info = calibPhase.querySelector('.info');
+    info.querySelector('h2').textContent = 'CALIBRATION COMPLETE';
+    info.querySelector('p').textContent = '';
+
+    document.getElementById('accuracyScore').textContent = rating;
+    document.getElementById('accuracyScore').style.color = color;
+    document.getElementById('accuracyScore').style.textShadow = `0 0 20px ${color}40`;
+    document.getElementById('accuracyLabel').textContent =
+        `Average error: ${Math.round(avgError)}px · ${rating === 'NEEDS IMPROVEMENT' ? 'Try recalibrating for better results' : 'Ready to play!'}`;
+    validationFeedback.style.display = 'block';
+}
+
+document.getElementById('acceptCalibration').addEventListener('click', () => {
+    validationFeedback.style.display = 'none';
+    startGame();
+});
+
+document.getElementById('retryCalibration').addEventListener('click', () => {
+    validationFeedback.style.display = 'none';
+    try { webgazer.clearData(); } catch (e) {}
+    startCalibration();
+});
 
 // ============================================================
 //  EVENT LISTENERS
@@ -654,6 +887,9 @@ document.getElementById('recalibrateButton').addEventListener('click', () => {
     if (webgazerReady) {
         document.getElementById('gameOver').classList.add('hidden');
         try { webgazer.clearData(); } catch (e) {}
+        gazeInitialized = false;
+        rollingBufX = []; rollingBufY = [];
+        recentVelocity = 0;
         startCalibration();
     } else startGame();
 });
