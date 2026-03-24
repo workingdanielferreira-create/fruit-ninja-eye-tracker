@@ -540,7 +540,7 @@ function update(ts) {
     for (let i = fruits.length-1; i >= 0; i--) { fruits[i].update(); if (fruits[i].y > canvas.height+100) fruits.splice(i,1); }
     for (let i = particles.length-1; i >= 0; i--) { particles[i].update(); if (particles[i].isDead()) particles.splice(i,1); }
     for (let i = scorePopups.length-1; i >= 0; i--) { const p = scorePopups[i]; p.y += p.vy; p.alpha -= 0.016; p.life--; if (p.life <= 0) scorePopups.splice(i,1); }
-    slashTrail.push({ x: gazeX, y: gazeY, alpha: 0.7 }); if (slashTrail.length > 14) slashTrail.shift();
+    slashTrail.push({ x: gazeX, y: gazeY, alpha: 0.8 }); if (slashTrail.length > 20) slashTrail.shift();
     for (const pt of slashTrail) pt.alpha -= 0.045;
     checkGazeCollision();
     document.getElementById('score').textContent = gameState.score;
@@ -552,8 +552,11 @@ function draw() {
     ctx.fillStyle = 'rgba(13,13,26,0.35)'; ctx.fillRect(0, 0, canvas.width, canvas.height);
     for (let i = 1; i < slashTrail.length; i++) {
         const pt = slashTrail[i], prev = slashTrail[i-1]; if (pt.alpha <= 0) continue;
-        ctx.save(); ctx.globalAlpha = Math.max(0, pt.alpha)*0.5; ctx.strokeStyle = '#ffd700';
-        ctx.lineWidth = 3; ctx.shadowBlur = 10; ctx.shadowColor = '#ffd700';
+        const t = i / slashTrail.length;
+        ctx.save(); ctx.globalAlpha = Math.max(0, pt.alpha) * 0.7;
+        ctx.strokeStyle = `rgba(255,${Math.floor(30 + 60 * (1 - t))},${Math.floor(10 + 20 * (1 - t))},1)`;
+        ctx.lineWidth = 2 + 4 * t; ctx.shadowBlur = 15 + 10 * t; ctx.shadowColor = '#ff0000';
+        ctx.lineCap = 'round';
         ctx.beginPath(); ctx.moveTo(prev.x, prev.y); ctx.lineTo(pt.x, pt.y); ctx.stroke(); ctx.restore();
     }
     for (const p of particles) p.draw();
@@ -565,12 +568,16 @@ function draw() {
         ctx.fillText(p.text, p.x, p.y); ctx.restore();
     }
     ctx.save();
-    ctx.beginPath(); ctx.arc(gazeX, gazeY, 26, 0, Math.PI*2);
-    ctx.fillStyle = 'rgba(255,215,0,0.12)'; ctx.fill();
-    ctx.beginPath(); ctx.arc(gazeX, gazeY, 26, 0, Math.PI*2);
-    ctx.strokeStyle = 'rgba(255,215,0,0.45)'; ctx.lineWidth = 2; ctx.stroke();
-    ctx.beginPath(); ctx.arc(gazeX, gazeY, 4, 0, Math.PI*2);
-    ctx.fillStyle = 'rgba(255,215,0,0.85)'; ctx.fill();
+    ctx.shadowBlur = 30; ctx.shadowColor = '#ff0000';
+    ctx.beginPath(); ctx.arc(gazeX, gazeY, 18, 0, Math.PI*2);
+    ctx.fillStyle = 'rgba(255,0,0,0.08)'; ctx.fill();
+    ctx.beginPath(); ctx.arc(gazeX, gazeY, 10, 0, Math.PI*2);
+    ctx.fillStyle = 'rgba(255,0,0,0.15)'; ctx.fill();
+    ctx.shadowBlur = 20; ctx.shadowColor = '#ff3333';
+    ctx.beginPath(); ctx.arc(gazeX, gazeY, 5, 0, Math.PI*2);
+    ctx.fillStyle = 'rgba(255,80,80,0.9)'; ctx.fill();
+    ctx.beginPath(); ctx.arc(gazeX, gazeY, 2, 0, Math.PI*2);
+    ctx.fillStyle = 'rgba(255,220,220,1)'; ctx.fill();
     ctx.restore();
 }
 
